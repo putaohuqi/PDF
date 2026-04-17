@@ -599,7 +599,7 @@ mergeBtn.addEventListener('click', async () => {
       const buf = await readFile(file);
       let src;
       try {
-        src = await PDFLib.PDFDocument.load(buf, { ignoreEncryption: true });
+        src = await PDFLib.PDFDocument.load(buf, { ignoreEncryption: true, throwOnInvalidObject: false });
       } catch (e) {
         throw new Error(`Could not load "${file.name}": ${e.message}`);
       }
