@@ -290,10 +290,10 @@
   <!-- UNLOCK TAB -->
   <div class="tab-panel active" id="tab-unlock">
     <div class="drop-zone" id="unlock-drop">
-      <input type="file" accept=".pdf" id="unlock-input">
+      <input type="file" accept=".pdf" multiple id="unlock-input">
       <div class="drop-zone-label">
         <span>⬆</span>
-        Drop a PDF here, or click to select
+        Drop PDFs here, or click to select multiple
       </div>
     </div>
 
@@ -389,10 +389,28 @@ document.querySelectorAll('.drop-zone').forEach(zone => {
   zone.addEventListener('drop', e => { e.preventDefault(); zone.classList.remove('drag-over'); });
 });
 
+// ─── Shared: copy all pages from srcDoc into targetDoc (two strategies) ───────
+async function appendPages(targetDoc, srcDoc) {
+  // Strategy 1: copyPages — preserves links, forms, annotations
+  try {
+    const pages = await targetDoc.copyPages(srcDoc, srcDoc.getPageIndices());
+    pages.forEach(p => targetDoc.addPage(p));
+    return;
+  } catch (_) { /* fall through */ }
+
+  // Strategy 2: embedPdf — more compatible, flattens interactive elements
+  const embedded = await targetDoc.embedPdf(srcDoc, srcDoc.getPageIndices());
+  for (const ep of embedded) {
+    const { width, height } = ep;
+    const page = targetDoc.addPage([width, height]);
+    page.drawPage(ep);
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // UNLOCK
 // ═══════════════════════════════════════════════════════════════════════════════
-let unlockFile = null;
+let unlockFiles = [];
 
 const unlockInput   = document.getElementById('unlock-input');
 const unlockDrop    = document.getElementById('unlock-drop');
@@ -401,76 +419,98 @@ const unlockBtn     = document.getElementById('unlock-btn');
 const unlockClear   = document.getElementById('unlock-clear');
 const unlockStatus  = document.getElementById('unlock-status');
 
-function setUnlockFile(file) {
-  if (!file || file.type !== 'application/pdf') {
-    setStatus(unlockStatus, 'error', 'Please select a valid PDF file.');
-    return;
-  }
-  unlockFile = file;
-  unlockStatus.className = 'status';
-
+function renderUnlockList() {
   unlockList.innerHTML = '';
-  const item = document.createElement('div');
-  item.className = 'file-item';
-  item.innerHTML = `
-    <span class="file-name">${escHtml(file.name)}</span>
-    <span class="file-size">${fmtBytes(file.size)}</span>
-    <button class="remove-btn" title="Remove">✕</button>
-  `;
-  item.querySelector('.remove-btn').addEventListener('click', clearUnlock);
-  unlockList.appendChild(item);
+  unlockFiles.forEach((file, i) => {
+    const item = document.createElement('div');
+    item.className = 'file-item';
+    item.innerHTML = `
+      <span class="file-name">${escHtml(file.name)}</span>
+      <span class="file-size">${fmtBytes(file.size)}</span>
+      <button class="remove-btn" title="Remove">✕</button>
+    `;
+    item.querySelector('.remove-btn').addEventListener('click', () => {
+      unlockFiles.splice(i, 1);
+      renderUnlockList();
+      updateUnlockState();
+    });
+    unlockList.appendChild(item);
+  });
+}
 
-  unlockBtn.disabled = false;
-  unlockClear.style.display = '';
+function updateUnlockState() {
+  unlockStatus.className = 'status';
+  unlockBtn.disabled = unlockFiles.length === 0;
+  unlockClear.style.display = unlockFiles.length ? '' : 'none';
+  unlockBtn.textContent = unlockFiles.length > 1
+    ? `Unlock & Download All (${unlockFiles.length})`
+    : 'Unlock & Download';
+}
+
+function addUnlockFiles(files) {
+  const pdfs = Array.from(files).filter(f => f.type === 'application/pdf');
+  const skipped = files.length - pdfs.length;
+  unlockFiles = unlockFiles.concat(pdfs);
+  renderUnlockList();
+  updateUnlockState();
+  if (skipped > 0) setStatus(unlockStatus, 'error', `${skipped} non-PDF file(s) skipped.`);
 }
 
 function clearUnlock() {
-  unlockFile = null;
-  unlockList.innerHTML = '';
-  unlockBtn.disabled = true;
-  unlockClear.style.display = 'none';
-  unlockStatus.className = 'status';
+  unlockFiles = [];
+  renderUnlockList();
+  updateUnlockState();
   unlockInput.value = '';
 }
 
 unlockInput.addEventListener('change', () => {
-  if (unlockInput.files[0]) setUnlockFile(unlockInput.files[0]);
+  if (unlockInput.files.length) addUnlockFiles(unlockInput.files);
+  unlockInput.value = '';
 });
 
 unlockDrop.addEventListener('drop', e => {
-  const file = e.dataTransfer.files[0];
-  if (file) setUnlockFile(file);
+  if (e.dataTransfer.files.length) addUnlockFiles(e.dataTransfer.files);
 });
 
 unlockClear.addEventListener('click', clearUnlock);
 
 unlockBtn.addEventListener('click', async () => {
-  if (!unlockFile) return;
+  if (!unlockFiles.length) return;
   unlockBtn.disabled = true;
-  setStatus(unlockStatus, 'working', 'Processing…');
+  const total = unlockFiles.length;
 
-  try {
-    const buf = await readFile(unlockFile);
-    const pdfDoc = await PDFLib.PDFDocument.load(buf, { ignoreEncryption: true });
-
-    // Strip encryption dictionary and permission flags
-    const context = pdfDoc.context;
-    const trailer = context.trailerInfo;
-    if (trailer.Encrypt) {
-      context.delete(trailer.Encrypt);
-      trailer.Encrypt = undefined;
+  let done = 0, failed = 0;
+  for (const file of unlockFiles) {
+    setStatus(unlockStatus, 'working',
+      total > 1 ? `Processing ${done + 1} of ${total}: ${file.name}` : 'Processing…');
+    try {
+      const buf = await readFile(file);
+      // Load ignoring encryption, then copy into a brand-new clean document.
+      // This avoids saving the encrypted doc directly (which triggers the pdf-lib bug).
+      const src = await PDFLib.PDFDocument.load(buf, {
+        ignoreEncryption: true,
+        throwOnInvalidObject: false,
+      });
+      const newDoc = await PDFLib.PDFDocument.create();
+      await appendPages(newDoc, src);
+      const pdfBytes = await newDoc.save();
+      const outName = file.name.replace(/\.pdf$/i, '') + '_unlocked.pdf';
+      triggerDownload(pdfBytes, outName);
+      done++;
+    } catch (err) {
+      console.error(file.name, err);
+      failed++;
     }
-
-    const pdfBytes = await pdfDoc.save({ useObjectStreams: false });
-    const outName = unlockFile.name.replace(/\.pdf$/i, '') + '_unlocked.pdf';
-    triggerDownload(pdfBytes, outName);
-    setStatus(unlockStatus, 'success', `Done! Saved as "${outName}"`);
-  } catch (err) {
-    console.error(err);
-    setStatus(unlockStatus, 'error', 'Error: ' + (err.message || 'Could not process this PDF.'));
-  } finally {
-    unlockBtn.disabled = false;
   }
+
+  if (failed === 0) {
+    setStatus(unlockStatus, 'success',
+      total > 1 ? `Done! ${total} files unlocked and downloaded.` : `Done! File unlocked and downloaded.`);
+  } else {
+    setStatus(unlockStatus, done > 0 ? 'working' : 'error',
+      `${done} succeeded, ${failed} failed. Check the console for details.`);
+  }
+  unlockBtn.disabled = false;
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -603,8 +643,11 @@ mergeBtn.addEventListener('click', async () => {
       } catch (e) {
         throw new Error(`Could not load "${file.name}": ${e.message}`);
       }
-      const pages = await merged.copyPages(src, src.getPageIndices());
-      pages.forEach(p => merged.addPage(p));
+      try {
+        await appendPages(merged, src);
+      } catch (e) {
+        throw new Error(`Could not copy pages from "${file.name}": ${e.message}`);
+      }
     }
 
     const pdfBytes = await merged.save();
