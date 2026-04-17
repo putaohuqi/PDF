@@ -273,6 +273,46 @@
       color: var(--text-muted);
       margin-top: 0.75rem;
     }
+
+    /* Annotate */
+    .annotate-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.65rem 0;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+
+    .tool-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-family: inherit;
+      font-size: 0.75rem;
+      letter-spacing: 0.06em;
+      padding: 0.4rem 0.7rem;
+      cursor: pointer;
+      border-radius: 2px;
+      transition: all 0.1s;
+    }
+    .tool-btn.active {
+      background: #ffd700;
+      border-color: #ffd700;
+      color: #111;
+    }
+    .tool-btn:hover:not(.active) { color: var(--text); border-color: var(--border-active); }
+
+    .annotate-viewer {
+      background: #111;
+      border: 1px solid var(--border);
+      margin-top: 0;
+      padding: 16px 8px;
+      max-height: 72vh;
+      overflow-y: auto;
+    }
+
+    .page-wrapper canvas { display: block; }
   </style>
 </head>
 <body>
@@ -286,6 +326,7 @@
   <div class="tabs">
     <button class="tab-btn active" data-tab="unlock">Unlock</button>
     <button class="tab-btn" data-tab="merge">Merge</button>
+    <button class="tab-btn" data-tab="annotate">Annotate</button>
   </div>
 
   <!-- UNLOCK TAB -->
@@ -338,6 +379,30 @@
       <strong>Drag to reorder</strong> the list before merging.
       The output PDF pages follow the order shown above.
     </p>
+  </div>
+
+  <!-- ANNOTATE TAB -->
+  <div class="tab-panel" id="tab-annotate">
+    <div id="annotate-drop-area">
+      <div class="drop-zone" id="annotate-drop">
+        <input type="file" accept=".pdf" id="annotate-input">
+        <div class="drop-zone-label">
+          <span>⬆</span>
+          Drop a PDF here to annotate
+        </div>
+      </div>
+    </div>
+
+    <div class="annotate-toolbar" id="annotate-toolbar" style="display:none">
+      <button class="tool-btn active" id="tool-highlight">&#9646; Highlight</button>
+      <div style="flex:1"></div>
+      <button class="btn btn-ghost" id="annotate-undo">Undo</button>
+      <button class="btn" id="annotate-download" disabled>Download</button>
+      <button class="btn btn-ghost" id="annotate-close">New file</button>
+    </div>
+
+    <div class="annotate-viewer" id="annotate-viewer" style="display:none"></div>
+    <div class="status" id="annotate-status"></div>
   </div>
 </div>
 
@@ -709,6 +774,207 @@ mergeBtn.addEventListener('click', async () => {
     mergeBtn.disabled = mergeFiles.length < 2;
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANNOTATE
+// ═══════════════════════════════════════════════════════════════════════════════
+const HL_COLOR = 'rgba(255, 215, 0, 0.42)';
+let annotatePdfJs   = null;
+let annotateInfos   = [];   // { canvas, imageData, displayScale, pdfW, pdfH }
+let annotateHL      = [];   // { page, x, y, w, h } stored at scale=1 (PDF pts, top-down)
+let annotateFilename = '';
+
+const annotateInput    = document.getElementById('annotate-input');
+const annotateDropEl   = document.getElementById('annotate-drop');
+const annotateDropArea = document.getElementById('annotate-drop-area');
+const annotateToolbar  = document.getElementById('annotate-toolbar');
+const annotateViewer   = document.getElementById('annotate-viewer');
+const annotateStatus   = document.getElementById('annotate-status');
+const annotateDownBtn  = document.getElementById('annotate-download');
+
+// Drop zone wiring
+annotateDropEl.addEventListener('dragover', e => { e.preventDefault(); annotateDropEl.classList.add('drag-over'); });
+annotateDropEl.addEventListener('dragleave', () => annotateDropEl.classList.remove('drag-over'));
+annotateDropEl.addEventListener('drop', e => {
+  e.preventDefault(); annotateDropEl.classList.remove('drag-over');
+  if (e.dataTransfer.files[0]) loadAnnotateFile(e.dataTransfer.files[0]);
+});
+annotateInput.addEventListener('change', () => {
+  if (annotateInput.files[0]) loadAnnotateFile(annotateInput.files[0]);
+  annotateInput.value = '';
+});
+
+document.getElementById('annotate-close').addEventListener('click', () => {
+  annotatePdfJs = null; annotateInfos = []; annotateHL = [];
+  annotateViewer.innerHTML = '';
+  annotateViewer.style.display = 'none';
+  annotateToolbar.style.display = 'none';
+  annotateDropArea.style.display = '';
+  annotateDownBtn.disabled = true;
+  annotateStatus.className = 'status';
+});
+
+document.getElementById('annotate-undo').addEventListener('click', () => {
+  if (!annotateHL.length) return;
+  const last = annotateHL.pop();
+  redrawAnnotatePage(last.page);
+});
+
+annotateDownBtn.addEventListener('click', async () => {
+  if (!annotatePdfJs) return;
+  annotateDownBtn.disabled = true;
+  setStatus(annotateStatus, 'working', 'Generating PDF…');
+  try {
+    const newDoc = await PDFLib.PDFDocument.create();
+    const RS = 2.0; // render scale for download quality
+    for (let i = 0; i < annotateInfos.length; i++) {
+      const info = annotateInfos[i];
+      setStatus(annotateStatus, 'working', `Exporting page ${i+1}/${annotateInfos.length}…`);
+      const pg = await annotatePdfJs.getPage(i + 1);
+      const vp = pg.getViewport({ scale: RS });
+      const cvs = document.createElement('canvas');
+      cvs.width = Math.round(vp.width); cvs.height = Math.round(vp.height);
+      const ctx = cvs.getContext('2d');
+      await pg.render({ canvasContext: ctx, viewport: vp }).promise;
+      ctx.fillStyle = HL_COLOR;
+      for (const h of annotateHL) {
+        if (h.page === i) ctx.fillRect(h.x * RS, h.y * RS, h.w * RS, h.h * RS);
+      }
+      const b64 = cvs.toDataURL('image/jpeg', 0.93).split(',')[1];
+      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      const img = await newDoc.embedJpg(bytes);
+      const p = newDoc.addPage([info.pdfW, info.pdfH]);
+      p.drawImage(img, { x: 0, y: 0, width: info.pdfW, height: info.pdfH });
+    }
+    const pdfBytes = await newDoc.save();
+    triggerDownload(pdfBytes, annotateFilename.replace(/\.pdf$/i, '') + '_annotated.pdf');
+    setStatus(annotateStatus, 'success', 'Downloaded!');
+  } catch (err) {
+    console.error(err);
+    setStatus(annotateStatus, 'error', 'Export failed: ' + err.message);
+  } finally {
+    annotateDownBtn.disabled = false;
+  }
+});
+
+async function loadAnnotateFile(file) {
+  if (file.type !== 'application/pdf') {
+    setStatus(annotateStatus, 'error', 'Please select a PDF file.');
+    return;
+  }
+  annotateFilename = file.name;
+  annotateInfos = []; annotateHL = [];
+  annotateViewer.innerHTML = '';
+  setStatus(annotateStatus, 'working', 'Loading…');
+  try {
+    const buf = await readFile(file);
+    annotatePdfJs = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
+
+    annotateDropArea.style.display = 'none';
+    annotateToolbar.style.display = 'flex';
+    annotateViewer.style.display = 'block';
+
+    const availW = annotateViewer.clientWidth - 16 || 620;
+
+    for (let i = 1; i <= annotatePdfJs.numPages; i++) {
+      setStatus(annotateStatus, 'working', `Rendering page ${i}/${annotatePdfJs.numPages}…`);
+      const pg = await annotatePdfJs.getPage(i);
+      const vp1 = pg.getViewport({ scale: 1.0 });
+      const ds = Math.min(availW / vp1.width, 2.0);
+      const vp = pg.getViewport({ scale: ds });
+
+      const cvs = document.createElement('canvas');
+      cvs.width = Math.round(vp.width); cvs.height = Math.round(vp.height);
+      const ctx = cvs.getContext('2d');
+      await pg.render({ canvasContext: ctx, viewport: vp }).promise;
+      const imageData = ctx.getImageData(0, 0, cvs.width, cvs.height);
+
+      const pageIdx = i - 1;
+      annotateInfos.push({ canvas: cvs, imageData, displayScale: ds, pdfW: vp1.width, pdfH: vp1.height });
+
+      // Wrapper: canvas + invisible overlay
+      const wrapper = document.createElement('div');
+      wrapper.style.cssText = `position:relative;width:${cvs.width}px;margin:0 auto 10px;` +
+                              `box-shadow:0 2px 16px rgba(0,0,0,0.6);`;
+      const overlay = document.createElement('div');
+      overlay.style.cssText = 'position:absolute;inset:0;cursor:crosshair;';
+
+      // ── Drawing logic ──
+      let drawing = false, sx = 0, sy = 0;
+
+      function coords(e) {
+        const r = cvs.getBoundingClientRect();
+        const sx2 = cvs.width / r.width, sy2 = cvs.height / r.height;
+        const src = e.changedTouches ? e.changedTouches[0] : (e.touches ? e.touches[0] : e);
+        return { x: (src.clientX - r.left) * sx2, y: (src.clientY - r.top) * sy2 };
+      }
+
+      overlay.addEventListener('mousedown', e => {
+        drawing = true; const p = coords(e); sx = p.x; sy = p.y;
+      });
+      overlay.addEventListener('touchstart', e => {
+        e.preventDefault(); drawing = true; const p = coords(e); sx = p.x; sy = p.y;
+      }, { passive: false });
+
+      overlay.addEventListener('mousemove', e => {
+        if (!drawing) return;
+        const p = coords(e);
+        redrawAnnotatePage(pageIdx);
+        const c = cvs.getContext('2d');
+        c.fillStyle = HL_COLOR;
+        c.fillRect(Math.min(sx,p.x), Math.min(sy,p.y), Math.abs(p.x-sx), Math.abs(p.y-sy));
+      });
+      overlay.addEventListener('touchmove', e => {
+        e.preventDefault();
+        if (!drawing) return;
+        const p = coords(e);
+        redrawAnnotatePage(pageIdx);
+        const c = cvs.getContext('2d');
+        c.fillStyle = HL_COLOR;
+        c.fillRect(Math.min(sx,p.x), Math.min(sy,p.y), Math.abs(p.x-sx), Math.abs(p.y-sy));
+      }, { passive: false });
+
+      function finishDraw(e) {
+        if (!drawing) return; drawing = false;
+        const p = coords(e);
+        const x = Math.min(sx,p.x), y = Math.min(sy,p.y);
+        const w = Math.abs(p.x-sx), h = Math.abs(p.y-sy);
+        if (w > 5 && h > 3) {
+          const d = annotateInfos[pageIdx].displayScale;
+          annotateHL.push({ page: pageIdx, x: x/d, y: y/d, w: w/d, h: h/d });
+        }
+        redrawAnnotatePage(pageIdx);
+      }
+      overlay.addEventListener('mouseup', finishDraw);
+      overlay.addEventListener('touchend', finishDraw);
+
+      wrapper.appendChild(cvs);
+      wrapper.appendChild(overlay);
+      annotateViewer.appendChild(wrapper);
+    }
+
+    annotateDownBtn.disabled = false;
+    annotateStatus.className = 'status';
+  } catch (err) {
+    console.error(err);
+    setStatus(annotateStatus, 'error', 'Failed to load: ' + err.message);
+    annotateDropArea.style.display = '';
+    annotateToolbar.style.display = 'none';
+    annotateViewer.style.display = 'none';
+  }
+}
+
+function redrawAnnotatePage(pageIdx) {
+  const info = annotateInfos[pageIdx];
+  const ctx = info.canvas.getContext('2d');
+  ctx.putImageData(info.imageData, 0, 0);
+  ctx.fillStyle = HL_COLOR;
+  for (const h of annotateHL) {
+    if (h.page === pageIdx)
+      ctx.fillRect(h.x * info.displayScale, h.y * info.displayScale,
+                   h.w * info.displayScale, h.h * info.displayScale);
+  }
+}
 </script>
 </body>
 </html>
