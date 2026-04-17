@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PDF Toolkit</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -341,6 +342,10 @@
 </div>
 
 <script>
+// ─── PDF.js worker ───────────────────────────────────────────────────────────
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
 // ─── Tab switching ────────────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -405,6 +410,34 @@ async function appendPages(targetDoc, srcDoc) {
     const page = targetDoc.addPage([width, height]);
     page.drawPage(ep);
   }
+}
+
+// ─── PDF.js render: each page → canvas → JPEG → pdf-lib page ─────────────────
+// Works on any PDF including owner-password-restricted ones.
+async function renderFileToDoc(file, onPage) {
+  const buf = await readFile(file);
+  const task = pdfjsLib.getDocument({ data: new Uint8Array(buf) });
+  const pdfJs = await task.promise;
+  const newDoc = await PDFLib.PDFDocument.create();
+
+  for (let i = 1; i <= pdfJs.numPages; i++) {
+    if (onPage) onPage(i, pdfJs.numPages);
+    const page = await pdfJs.getPage(i);
+    const vp1 = page.getViewport({ scale: 1.0 });       // original pts
+    const vp2 = page.getViewport({ scale: 2.0 });       // 2× for sharpness
+
+    const canvas = document.createElement('canvas');
+    canvas.width  = Math.round(vp2.width);
+    canvas.height = Math.round(vp2.height);
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp2 }).promise;
+
+    const b64   = canvas.toDataURL('image/jpeg', 0.95).split(',')[1];
+    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const img   = await newDoc.embedJpg(bytes);
+    const p     = newDoc.addPage([vp1.width, vp1.height]);
+    p.drawImage(img, { x: 0, y: 0, width: vp1.width, height: vp1.height });
+  }
+  return newDoc;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -484,15 +517,23 @@ unlockBtn.addEventListener('click', async () => {
     setStatus(unlockStatus, 'working',
       total > 1 ? `Processing ${done + 1} of ${total}: ${file.name}` : 'Processing…');
     try {
-      const buf = await readFile(file);
-      // Load ignoring encryption, then copy into a brand-new clean document.
-      // This avoids saving the encrypted doc directly (which triggers the pdf-lib bug).
-      const src = await PDFLib.PDFDocument.load(buf, {
-        ignoreEncryption: true,
-        throwOnInvalidObject: false,
-      });
-      const newDoc = await PDFLib.PDFDocument.create();
-      await appendPages(newDoc, src);
+      let newDoc;
+      // Try pdf-lib first (preserves vectors/text); fall back to PDF.js canvas render.
+      try {
+        const buf = await readFile(file);
+        const src = await PDFLib.PDFDocument.load(buf, {
+          ignoreEncryption: true, throwOnInvalidObject: false,
+        });
+        newDoc = await PDFLib.PDFDocument.create();
+        await appendPages(newDoc, src);
+      } catch (_) {
+        newDoc = await renderFileToDoc(file, (pg, tot) => {
+          setStatus(unlockStatus, 'working',
+            total > 1
+              ? `${file.name}: page ${pg}/${tot} (${done + 1}/${total})`
+              : `Rendering page ${pg}/${tot}…`);
+        });
+      }
       const pdfBytes = await newDoc.save();
       const outName = file.name.replace(/\.pdf$/i, '') + '_unlocked.pdf';
       triggerDownload(pdfBytes, outName);
@@ -635,18 +676,26 @@ mergeBtn.addEventListener('click', async () => {
   try {
     const merged = await PDFLib.PDFDocument.create();
 
-    for (const file of mergeFiles) {
-      const buf = await readFile(file);
-      let src;
+    for (let fi = 0; fi < mergeFiles.length; fi++) {
+      const file = mergeFiles[fi];
+      setStatus(mergeStatus, 'working', `Loading ${fi + 1}/${mergeFiles.length}: ${file.name}…`);
+      let appended = false;
+      // Try pdf-lib path first (better quality, preserves vectors)
       try {
-        src = await PDFLib.PDFDocument.load(buf, { ignoreEncryption: true, throwOnInvalidObject: false });
-      } catch (e) {
-        throw new Error(`Could not load "${file.name}": ${e.message}`);
-      }
-      try {
+        const buf = await readFile(file);
+        const src = await PDFLib.PDFDocument.load(buf, { ignoreEncryption: true, throwOnInvalidObject: false });
         await appendPages(merged, src);
-      } catch (e) {
-        throw new Error(`Could not copy pages from "${file.name}": ${e.message}`);
+        appended = true;
+      } catch (_) { /* fall through */ }
+
+      // Fall back to PDF.js canvas render
+      if (!appended) {
+        const rendered = await renderFileToDoc(file, (pg, tot) => {
+          setStatus(mergeStatus, 'working',
+            `Rendering ${file.name}: page ${pg}/${tot} (file ${fi + 1}/${mergeFiles.length})…`);
+        });
+        const pages = await merged.copyPages(rendered, rendered.getPageIndices());
+        pages.forEach(p => merged.addPage(p));
       }
     }
 
