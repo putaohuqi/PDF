@@ -20,6 +20,11 @@
       --success: #4ade80;
       --error: #f87171;
       --drag-over: #222;
+      --highlight-1: #8c8bae;
+      --highlight-2: #a7a6c1;
+      --highlight-3: #babacf;
+      --highlight-4: #c5b4cb;
+      --highlight-5: #a592b1;
     }
 
     body {
@@ -51,6 +56,10 @@
     .container {
       max-width: 680px;
       margin: 0 auto;
+    }
+
+    .container.annotate-mode {
+      max-width: min(1500px, calc(100vw - 2rem));
     }
 
     /* Tabs */
@@ -297,22 +306,40 @@
       transition: all 0.1s;
     }
     .tool-btn.active {
-      background: #ffd700;
-      border-color: #ffd700;
+      background: var(--highlight-1);
+      border-color: var(--highlight-1);
       color: #111;
     }
     .tool-btn:hover:not(.active) { color: var(--text); border-color: var(--border-active); }
 
     .annotate-viewer {
-      background: #111;
+      background: #0b0b0d;
       border: 1px solid var(--border);
       margin-top: 0;
-      padding: 16px 8px;
-      max-height: 72vh;
-      overflow-y: auto;
+      padding: 18px 14px;
+      max-height: 82vh;
+      overflow: auto;
     }
 
     .page-wrapper canvas { display: block; }
+
+    .hl-colors { display: flex; gap: 5px; align-items: center; }
+    .hl-swatch {
+      width: 20px; height: 20px; border-radius: 3px; cursor: pointer;
+      border: 2px solid transparent; padding: 0; flex-shrink: 0;
+      transition: border-color 0.1s, transform 0.1s;
+    }
+    .hl-swatch:hover { transform: scale(1.15); }
+    .hl-swatch.active { border-color: var(--text); }
+
+    @media (max-width: 900px) {
+      body { padding: 1rem 0.75rem; }
+      .container.annotate-mode { max-width: 100%; }
+      .annotate-viewer {
+        padding: 12px 6px;
+        max-height: 76vh;
+      }
+    }
   </style>
 </head>
 <body>
@@ -395,6 +422,13 @@
 
     <div class="annotate-toolbar" id="annotate-toolbar" style="display:none">
       <button class="tool-btn active" id="tool-highlight">&#9646; Highlight</button>
+      <div class="hl-colors" id="hl-colors">
+        <button class="hl-swatch active" data-color="rgba(140,139,174,0.42)" style="background:var(--highlight-1)" title="Dusty periwinkle"></button>
+        <button class="hl-swatch" data-color="rgba(167,166,193,0.42)" style="background:var(--highlight-2)" title="Soft lavender"></button>
+        <button class="hl-swatch" data-color="rgba(186,186,207,0.42)" style="background:var(--highlight-3)" title="Light lilac"></button>
+        <button class="hl-swatch" data-color="rgba(197,180,203,0.42)" style="background:var(--highlight-4)" title="Pink mist"></button>
+        <button class="hl-swatch" data-color="rgba(165,146,177,0.42)" style="background:var(--highlight-5)" title="Muted mauve"></button>
+      </div>
       <div style="flex:1"></div>
       <button class="btn btn-ghost" id="annotate-undo">Undo</button>
       <button class="btn" id="annotate-download" disabled>Download</button>
@@ -412,12 +446,14 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
+const mainContainer = document.querySelector('.container');
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    mainContainer.classList.toggle('annotate-mode', btn.dataset.tab === 'annotate');
   });
 });
 
@@ -452,6 +488,25 @@ function readFile(file) {
   });
 }
 
+function base64ToBytes(b64) {
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+
+function canvasToPngBytes(canvas) {
+  return base64ToBytes(canvas.toDataURL('image/png').split(',')[1]);
+}
+
+function parseColorString(color) {
+  const m = color.match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)/i);
+  if (!m) throw new Error(`Unsupported color format: ${color}`);
+  return {
+    r: Number(m[1]),
+    g: Number(m[2]),
+    b: Number(m[3]),
+    a: m[4] == null ? 1 : Number(m[4]),
+  };
+}
+
 // ─── Drag-over styling for drop zones ────────────────────────────────────────
 document.querySelectorAll('.drop-zone').forEach(zone => {
   zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
@@ -477,28 +532,27 @@ async function appendPages(targetDoc, srcDoc) {
   }
 }
 
-// ─── PDF.js render: each page → canvas → JPEG → pdf-lib page ─────────────────
+// ─── PDF.js render: each page → canvas → PNG → pdf-lib page ──────────────────
 // Works on any PDF including owner-password-restricted ones.
 async function renderFileToDoc(file, onPage) {
   const buf = await readFile(file);
   const task = pdfjsLib.getDocument({ data: new Uint8Array(buf) });
   const pdfJs = await task.promise;
   const newDoc = await PDFLib.PDFDocument.create();
+  const rasterScale = 2.5;
 
   for (let i = 1; i <= pdfJs.numPages; i++) {
     if (onPage) onPage(i, pdfJs.numPages);
     const page = await pdfJs.getPage(i);
     const vp1 = page.getViewport({ scale: 1.0 });       // original pts
-    const vp2 = page.getViewport({ scale: 2.0 });       // 2× for sharpness
+    const vp2 = page.getViewport({ scale: rasterScale });
 
     const canvas = document.createElement('canvas');
     canvas.width  = Math.round(vp2.width);
     canvas.height = Math.round(vp2.height);
     await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp2 }).promise;
 
-    const b64   = canvas.toDataURL('image/jpeg', 0.95).split(',')[1];
-    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-    const img   = await newDoc.embedJpg(bytes);
+    const img = await newDoc.embedPng(canvasToPngBytes(canvas));
     const p     = newDoc.addPage([vp1.width, vp1.height]);
     p.drawImage(img, { x: 0, y: 0, width: vp1.width, height: vp1.height });
   }
@@ -778,11 +832,12 @@ mergeBtn.addEventListener('click', async () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 // ANNOTATE
 // ═══════════════════════════════════════════════════════════════════════════════
-const HL_COLOR = 'rgba(255, 215, 0, 0.42)';
+let hlColor = 'rgba(140,139,174,0.42)';
 let annotatePdfJs   = null;
 let annotateInfos   = [];   // { canvas, imageData, displayScale, pdfW, pdfH }
-let annotateHL      = [];   // { page, x, y, w, h } stored at scale=1 (PDF pts, top-down)
+let annotateHL      = [];   // { page, x, y, w, h, color } stored at scale=1 (PDF pts, top-down)
 let annotateFilename = '';
+let annotateSourceBytes = null;
 
 const annotateInput    = document.getElementById('annotate-input');
 const annotateDropEl   = document.getElementById('annotate-drop');
@@ -791,6 +846,15 @@ const annotateToolbar  = document.getElementById('annotate-toolbar');
 const annotateViewer   = document.getElementById('annotate-viewer');
 const annotateStatus   = document.getElementById('annotate-status');
 const annotateDownBtn  = document.getElementById('annotate-download');
+
+// Color swatches
+document.getElementById('hl-colors').addEventListener('click', e => {
+  const btn = e.target.closest('.hl-swatch');
+  if (!btn) return;
+  document.querySelectorAll('.hl-swatch').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  hlColor = btn.dataset.color;
+});
 
 // Drop zone wiring
 annotateDropEl.addEventListener('dragover', e => { e.preventDefault(); annotateDropEl.classList.add('drag-over'); });
@@ -805,7 +869,7 @@ annotateInput.addEventListener('change', () => {
 });
 
 document.getElementById('annotate-close').addEventListener('click', () => {
-  annotatePdfJs = null; annotateInfos = []; annotateHL = [];
+  annotatePdfJs = null; annotateInfos = []; annotateHL = []; annotateSourceBytes = null;
   annotateViewer.innerHTML = '';
   annotateViewer.style.display = 'none';
   annotateToolbar.style.display = 'none';
@@ -825,28 +889,56 @@ annotateDownBtn.addEventListener('click', async () => {
   annotateDownBtn.disabled = true;
   setStatus(annotateStatus, 'working', 'Generating PDF…');
   try {
-    const newDoc = await PDFLib.PDFDocument.create();
-    const RS = 2.0; // render scale for download quality
-    for (let i = 0; i < annotateInfos.length; i++) {
-      const info = annotateInfos[i];
-      setStatus(annotateStatus, 'working', `Exporting page ${i+1}/${annotateInfos.length}…`);
-      const pg = await annotatePdfJs.getPage(i + 1);
-      const vp = pg.getViewport({ scale: RS });
-      const cvs = document.createElement('canvas');
-      cvs.width = Math.round(vp.width); cvs.height = Math.round(vp.height);
-      const ctx = cvs.getContext('2d');
-      await pg.render({ canvasContext: ctx, viewport: vp }).promise;
-      ctx.fillStyle = HL_COLOR;
-      for (const h of annotateHL) {
-        if (h.page === i) ctx.fillRect(h.x * RS, h.y * RS, h.w * RS, h.h * RS);
+    let pdfBytes = null;
+
+    try {
+      const srcDoc = await PDFLib.PDFDocument.load(annotateSourceBytes.slice(0), {
+        ignoreEncryption: true,
+        throwOnInvalidObject: false,
+      });
+      const pages = srcDoc.getPages();
+      annotateHL.forEach((h, index) => {
+        setStatus(annotateStatus, 'working', `Applying highlight ${index + 1}/${annotateHL.length}…`);
+        const page = pages[h.page];
+        const { r, g, b, a } = parseColorString(h.color);
+        page.drawRectangle({
+          x: h.x,
+          y: page.getHeight() - h.y - h.h,
+          width: h.w,
+          height: h.h,
+          color: PDFLib.rgb(r / 255, g / 255, b / 255),
+          opacity: a,
+          borderWidth: 0,
+        });
+      });
+      pdfBytes = await srcDoc.save();
+    } catch (vectorErr) {
+      console.warn('Vector export failed, falling back to raster export.', vectorErr);
+      const newDoc = await PDFLib.PDFDocument.create();
+      const rasterScale = 3.0;
+      for (let i = 0; i < annotateInfos.length; i++) {
+        const info = annotateInfos[i];
+        setStatus(annotateStatus, 'working', `Exporting page ${i + 1}/${annotateInfos.length}…`);
+        const pg = await annotatePdfJs.getPage(i + 1);
+        const vp = pg.getViewport({ scale: rasterScale });
+        const cvs = document.createElement('canvas');
+        cvs.width = Math.round(vp.width);
+        cvs.height = Math.round(vp.height);
+        const ctx = cvs.getContext('2d');
+        await pg.render({ canvasContext: ctx, viewport: vp }).promise;
+        for (const h of annotateHL) {
+          if (h.page === i) {
+            ctx.fillStyle = h.color;
+            ctx.fillRect(h.x * rasterScale, h.y * rasterScale, h.w * rasterScale, h.h * rasterScale);
+          }
+        }
+        const img = await newDoc.embedPng(canvasToPngBytes(cvs));
+        const p = newDoc.addPage([info.pdfW, info.pdfH]);
+        p.drawImage(img, { x: 0, y: 0, width: info.pdfW, height: info.pdfH });
       }
-      const b64 = cvs.toDataURL('image/jpeg', 0.93).split(',')[1];
-      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-      const img = await newDoc.embedJpg(bytes);
-      const p = newDoc.addPage([info.pdfW, info.pdfH]);
-      p.drawImage(img, { x: 0, y: 0, width: info.pdfW, height: info.pdfH });
+      pdfBytes = await newDoc.save();
     }
-    const pdfBytes = await newDoc.save();
+
     triggerDownload(pdfBytes, annotateFilename.replace(/\.pdf$/i, '') + '_annotated.pdf');
     setStatus(annotateStatus, 'success', 'Downloaded!');
   } catch (err) {
@@ -863,38 +955,46 @@ async function loadAnnotateFile(file) {
     return;
   }
   annotateFilename = file.name;
-  annotateInfos = []; annotateHL = [];
+  annotateInfos = []; annotateHL = []; annotateSourceBytes = null;
   annotateViewer.innerHTML = '';
   setStatus(annotateStatus, 'working', 'Loading…');
   try {
     const buf = await readFile(file);
+    annotateSourceBytes = buf.slice(0);
     annotatePdfJs = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
 
     annotateDropArea.style.display = 'none';
     annotateToolbar.style.display = 'flex';
     annotateViewer.style.display = 'block';
 
-    const availW = annotateViewer.clientWidth - 16 || 620;
+    const dpr = window.devicePixelRatio || 1;
+    const availW = (annotateViewer.clientWidth - 28) || 1200;
 
     for (let i = 1; i <= annotatePdfJs.numPages; i++) {
       setStatus(annotateStatus, 'working', `Rendering page ${i}/${annotatePdfJs.numPages}…`);
       const pg = await annotatePdfJs.getPage(i);
       const vp1 = pg.getViewport({ scale: 1.0 });
-      const ds = Math.min(availW / vp1.width, 2.0);
-      const vp = pg.getViewport({ scale: ds });
+      const ds = Math.min(availW / vp1.width, 2.8);      // CSS scale
+      const renderScale = ds * dpr;                       // physical pixel scale
+      const vp = pg.getViewport({ scale: renderScale });
 
       const cvs = document.createElement('canvas');
       cvs.width = Math.round(vp.width); cvs.height = Math.round(vp.height);
+      // CSS size = logical pixels (sharp on HiDPI)
+      const cssW = Math.round(vp1.width * ds);
+      const cssH = Math.round(vp1.height * ds);
+      cvs.style.width = cssW + 'px'; cvs.style.height = cssH + 'px';
       const ctx = cvs.getContext('2d');
       await pg.render({ canvasContext: ctx, viewport: vp }).promise;
       const imageData = ctx.getImageData(0, 0, cvs.width, cvs.height);
 
       const pageIdx = i - 1;
-      annotateInfos.push({ canvas: cvs, imageData, displayScale: ds, pdfW: vp1.width, pdfH: vp1.height });
+      // displayScale = physical canvas pixels per PDF point
+      annotateInfos.push({ canvas: cvs, imageData, displayScale: renderScale, pdfW: vp1.width, pdfH: vp1.height });
 
       // Wrapper: canvas + invisible overlay
       const wrapper = document.createElement('div');
-      wrapper.style.cssText = `position:relative;width:${cvs.width}px;margin:0 auto 10px;` +
+      wrapper.style.cssText = `position:relative;width:${cssW}px;margin:0 auto 10px;` +
                               `box-shadow:0 2px 16px rgba(0,0,0,0.6);`;
       const overlay = document.createElement('div');
       overlay.style.cssText = 'position:absolute;inset:0;cursor:crosshair;';
@@ -921,7 +1021,7 @@ async function loadAnnotateFile(file) {
         const p = coords(e);
         redrawAnnotatePage(pageIdx);
         const c = cvs.getContext('2d');
-        c.fillStyle = HL_COLOR;
+        c.fillStyle = hlColor;
         c.fillRect(Math.min(sx,p.x), Math.min(sy,p.y), Math.abs(p.x-sx), Math.abs(p.y-sy));
       });
       overlay.addEventListener('touchmove', e => {
@@ -930,7 +1030,7 @@ async function loadAnnotateFile(file) {
         const p = coords(e);
         redrawAnnotatePage(pageIdx);
         const c = cvs.getContext('2d');
-        c.fillStyle = HL_COLOR;
+        c.fillStyle = hlColor;
         c.fillRect(Math.min(sx,p.x), Math.min(sy,p.y), Math.abs(p.x-sx), Math.abs(p.y-sy));
       }, { passive: false });
 
@@ -941,7 +1041,7 @@ async function loadAnnotateFile(file) {
         const w = Math.abs(p.x-sx), h = Math.abs(p.y-sy);
         if (w > 5 && h > 3) {
           const d = annotateInfos[pageIdx].displayScale;
-          annotateHL.push({ page: pageIdx, x: x/d, y: y/d, w: w/d, h: h/d });
+          annotateHL.push({ page: pageIdx, x: x/d, y: y/d, w: w/d, h: h/d, color: hlColor });
         }
         redrawAnnotatePage(pageIdx);
       }
@@ -968,11 +1068,12 @@ function redrawAnnotatePage(pageIdx) {
   const info = annotateInfos[pageIdx];
   const ctx = info.canvas.getContext('2d');
   ctx.putImageData(info.imageData, 0, 0);
-  ctx.fillStyle = HL_COLOR;
   for (const h of annotateHL) {
-    if (h.page === pageIdx)
+    if (h.page === pageIdx) {
+      ctx.fillStyle = h.color;
       ctx.fillRect(h.x * info.displayScale, h.y * info.displayScale,
                    h.w * info.displayScale, h.h * info.displayScale);
+    }
   }
 }
 </script>
